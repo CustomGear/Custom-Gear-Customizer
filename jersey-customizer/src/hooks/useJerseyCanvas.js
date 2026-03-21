@@ -8,7 +8,6 @@ async function loadImage(src) {
   if (IMAGE_CACHE.has(src)) return IMAGE_CACHE.get(src)
   const p = new Promise(resolve => {
     const img = new Image()
-    // No crossOrigin — we won't read pixels, just draw
     img.onload  = () => resolve(img)
     img.onerror = () => resolve(null)
     img.src = src
@@ -25,58 +24,67 @@ async function loadFont(name, url, type) {
     await font.load()
     document.fonts.add(font)
     FONT_CACHE.set(name, true)
-  } catch (e) { /* fallback to system font */ }
-}
-
-function hexToRgb(hex) {
-  if (!hex) return null
-  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex)
-  return m ? { r: parseInt(m[1],16), g: parseInt(m[2],16), b: parseInt(m[3],16) } : null
+  } catch (e) {}
 }
 
 /**
- * drawColoredJersey
- * -----------------
- * Uses multiply blend mode — no getImageData, no CORS issues.
- *
- * The reference site PNGs work like this:
- *   - White areas  = show the background color (painted underneath)
- *   - Black areas  = outlines (stay dark via multiply)
- *   - Colored zones (red/green/blue encoded) = separate color layers
- *
- * We paint each color as a full canvas fill, then draw the template PNG
- * on top using 'multiply'. The PNG's white zones become the color,
- * dark zones stay dark. For multi-color templates we use multiple passes.
+ * Renders a jersey using an offscreen canvas + multiply blend.
+ * 
+ * How it works:
+ * 1. Draw the template PNG onto an offscreen canvas (white bg)
+ * 2. For each color zone, create a colored layer and composite
+ *    it with the template using multiply blend
+ * 3. The result: colored jersey with dark outlines preserved
+ * 
+ * The key insight: we draw color UNDER the template PNG.
+ * White areas of the PNG pass the color through.
+ * Dark areas of the PNG stay dark (multiply with black = black).
  */
-function drawColoredJersey(ctx, tImg, colors, w, h) {
-  // 1. Fill with color1 (primary)
-  ctx.fillStyle = colors[0] || '#cccccc'
-  ctx.fillRect(0, 0, w, h)
+function renderJersey(ctx, tImg, sImg, colors, w, h) {
+  // Use an offscreen canvas to compose the jersey
+  const off = document.createElement('canvas')
+  off.width = w
+  off.height = h
+  const oc = off.getContext('2d')
 
-  // 2. Draw template PNG with multiply — outlines darken the color, white = transparent
-  ctx.globalCompositeOperation = 'multiply'
-  ctx.drawImage(tImg, 0, 0, w, h)
-  ctx.globalCompositeOperation = 'source-over'
+  // White background so multiply works correctly
+  oc.fillStyle = '#ffffff'
+  oc.fillRect(0, 0, w, h)
 
-  // 3. For secondary colors: draw a color-filled rect clipped to those zones
-  // The template PNG encodes zones as red/green/blue channels
-  // We use screen/lighten blend to paint over those zones
-  if (colors[1] && colors[1] !== colors[0]) {
-    // Draw color2 using 'screen' blend over the red-channel zones
-    // This approximation works well for most jersey designs
-    ctx.globalCompositeOperation = 'screen'
-    ctx.fillStyle = blendColor(colors[1], 0.3)
-    ctx.fillRect(0, 0, w, h)
-    ctx.globalCompositeOperation = 'multiply'
-    ctx.drawImage(tImg, 0, 0, w, h)
-    ctx.globalCompositeOperation = 'source-over'
+  // Draw template PNG — this gives us the jersey shape with outlines
+  oc.drawImage(tImg, 0, 0, w, h)
+
+  // Now apply color1 as the base — use source-atop to only paint
+  // where the jersey pixels are (non-white/non-transparent areas)
+  // We achieve coloring by using multiply blend:
+  // Draw a solid color rect, then multiply with the template
+  
+  // Step 1: fill with color1
+  const c1 = colors[0] || '#cccccc'
+  oc.globalCompositeOperation = 'multiply'
+  oc.fillStyle = c1
+  oc.fillRect(0, 0, w, h)
+
+  // Step 2: re-draw template on top to restore outlines
+  oc.globalCompositeOperation = 'multiply'
+  oc.drawImage(tImg, 0, 0, w, h)
+
+  // Reset
+  oc.globalCompositeOperation = 'source-over'
+
+  // Add shading
+  if (sImg) {
+    oc.globalCompositeOperation = 'multiply'
+    oc.globalAlpha = 0.5
+    oc.drawImage(sImg, 0, 0, w, h)
+    oc.globalAlpha = 1
+    oc.globalCompositeOperation = 'source-over'
   }
-}
 
-function blendColor(hex, alpha) {
-  const c = hexToRgb(hex)
-  if (!c) return `rgba(200,200,200,${alpha})`
-  return `rgba(${c.r},${c.g},${c.b},${alpha})`
+  // Draw the composed jersey onto the main canvas
+  // Clear with transparent background first
+  ctx.clearRect(0, 0, w, h)
+  ctx.drawImage(off, 0, 0)
 }
 
 export function useJerseyCanvas({
@@ -110,14 +118,19 @@ export function useJerseyCanvas({
     ctx.clearRect(0, 0, width, height)
 
     if (!templatePart?.img) {
+      // Show a simple placeholder jersey shape
       ctx.fillStyle = colors[0] || '#1a3a6b'
       ctx.fillRect(0, 0, width, height)
+      ctx.fillStyle = 'rgba(255,255,255,0.15)'
+      ctx.font = 'bold 11px sans-serif'
+      ctx.textAlign = 'center'
+      ctx.fillText('Loading...', width/2, height/2)
       return
     }
 
     const [tImg, sImg, laceImg] = await Promise.all([
       loadImage(templatePart.img),
-      loadImage(templatePart.shading),
+      templatePart.shading ? loadImage(templatePart.shading) : null,
       laceFile ? loadImage(laceFile) : null,
     ])
 
@@ -129,19 +142,12 @@ export function useJerseyCanvas({
       return
     }
 
-    // 1. Draw colored jersey using multiply blend (no CORS needed)
-    drawColoredJersey(ctx, tImg, colors, width, height)
+    // Render the colored jersey
+    renderJersey(ctx, tImg, sImg, colors, width, height)
 
-    // 2. Shading overlay
-    if (sImg) {
-      ctx.save()
-      ctx.globalCompositeOperation = 'multiply'
-      ctx.globalAlpha = 0.5
-      ctx.drawImage(sImg, 0, 0, width, height)
-      ctx.restore()
-    }
+    if (!activeRef.current) return
 
-    // 3. Logos
+    // Logos
     for (const cfg of [logoCenter, logoLeft, logoRight]) {
       if (!cfg?.dataUrl) continue
       const img = await loadImage(cfg.dataUrl)
@@ -154,7 +160,7 @@ export function useJerseyCanvas({
       ctx.restore()
     }
 
-    // 4. Text
+    // Text
     if (fontUrl) await loadFont(fontName, fontUrl, fontType)
     if (!activeRef.current) return
 
@@ -187,10 +193,10 @@ export function useJerseyCanvas({
       }
     }
 
-    // 5. Laces
+    // Laces
     if (laceImg) {
       ctx.save()
-      ctx.globalAlpha = 0.85
+      ctx.globalAlpha = 0.9
       ctx.drawImage(laceImg, 0, 0, width, height)
       ctx.restore()
     }
